@@ -71,6 +71,7 @@
 #include <linux/memory-tiers.h>
 #include <linux/debugfs.h>
 #include <linux/userfaultfd_k.h>
+#include <linux/ppt.h>
 #include <linux/dax.h>
 #include <linux/oom.h>
 #include <linux/numa.h>
@@ -5602,6 +5603,13 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 	writable = false;
 	ignore_writable = true;
+
+	/* Check PPT throttling */
+	if (ppt_should_throttle_promotion(vma->vm_mm, &folio->page, &flags)) {
+		/* Promotion throttled, map CXL page without migration */
+		folio_put(folio);
+		goto out_map;
+	}
 
 	/* Migrate to the requested node */
 	if (!migrate_misplaced_folio(folio, vma, target_nid)) {

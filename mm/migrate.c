@@ -44,6 +44,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/memory-tiers.h>
 #include <linux/pagewalk.h>
+#include <linux/ppt.h>
 
 #include <asm/tlbflush.h>
 
@@ -335,6 +336,22 @@ static bool remove_migration_pte(struct folio *folio,
 			else
 				folio_add_file_rmap_pte(folio, new, vma);
 			set_pte_at(vma->vm_mm, pvmw.address, pvmw.pte, pte);
+
+			/* Track PPT migration */
+			{
+				unsigned long old_pfn = page_to_pfn(pfn_swap_entry_to_page(entry));
+				unsigned long new_pfn = page_to_pfn(new);
+				int old_nid = page_to_nid(pfn_swap_entry_to_page(entry));
+				int new_nid = page_to_nid(new);
+
+				if (node_is_toptier(new_nid) && !node_is_toptier(old_nid)) {
+					/* Promotion: CXL -> DRAM */
+					ppt_track_promotion(vma->vm_mm, old_pfn, new_pfn);
+				} else if (!node_is_toptier(new_nid) && node_is_toptier(old_nid)) {
+					/* Demotion: DRAM -> CXL */
+					ppt_track_demotion(vma->vm_mm, old_pfn, new_pfn);
+				}
+			}
 		}
 		if (vma->vm_flags & VM_LOCKED)
 			mlock_drain_local();

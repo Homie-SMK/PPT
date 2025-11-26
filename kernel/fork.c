@@ -103,6 +103,7 @@
 #include <linux/user_events.h>
 #include <linux/iommu.h>
 #include <linux/rseq.h>
+#include <linux/ppt.h>
 #include <uapi/linux/pidfd.h>
 #include <linux/pidfs.h>
 #include <linux/tick.h>
@@ -1314,6 +1315,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 
 	mm->user_ns = get_user_ns(user_ns);
 	lru_gen_init_mm(mm);
+	ppt_mm_init(mm);
 	return mm;
 
 fail_pcpu:
@@ -1362,6 +1364,7 @@ static inline void __mmput(struct mm_struct *mm)
 	if (mm->binfmt)
 		module_put(mm->binfmt->module);
 	lru_gen_del_mm(mm);
+	ppt_mm_destroy(mm);
 	mmdrop(mm);
 }
 
@@ -1691,6 +1694,8 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 
 	if (!mm_init(mm, tsk, mm->user_ns))
 		goto fail_nomem;
+
+	ppt_mm_fork(oldmm, mm);
 
 	uprobe_start_dup_mmap();
 	err = dup_mmap(mm, oldmm);

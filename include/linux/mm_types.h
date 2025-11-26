@@ -31,6 +31,7 @@
 
 struct address_space;
 struct mem_cgroup;
+struct xarray;
 
 /*
  * Each physical page in the system has a struct page associated with
@@ -1004,6 +1005,12 @@ struct mm_struct {
 
 		/* numa_scan_seq prevents two threads remapping PTEs. */
 		int numa_scan_seq;
+#endif
+#ifdef CONFIG_PPT
+		/* Page ping-pong throttling for tiered memory */
+		struct xarray *ppt_xarray;       /* Tracks migrated pages */
+		atomic_t ppt_entry_count;        /* Number of tracked pages */
+		struct list_head ppt_mm_list;    /* Link in global mm list */
 #endif
 		/*
 		 * An operation with batched TLB flushing is going on. Anything

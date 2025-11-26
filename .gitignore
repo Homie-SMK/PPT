@@ -178,3 +178,13 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# Claude output
+build.log
+build-ppt.log
+claude_history
+CLAUDE.md
+install-kernel-ppt.sh
+
+# Perf
+tools/perf/pmu-events/

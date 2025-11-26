@@ -960,6 +960,21 @@ config NUMA_BALANCING_DEFAULT_ENABLED
 	  If set, automatic NUMA balancing will be enabled if running on a NUMA
 	  machine.
 
+config PPT
+	bool "Page Ping-pong Throttling for Tiered Memory"
+	depends on NUMA && NUMA_BALANCING && MIGRATION
+	depends on 64BIT
+	help
+	  Enable per-process tracking of promoted pages to prevent page
+	  ping-ponging between memory tiers (e.g., DRAM and CXL).
+
+	  Pages that are repeatedly promoted from slow memory (CXL) to fast
+	  memory (DRAM) and quickly demoted back are detected and throttled
+	  to reduce migration overhead.
+
+	  Say Y if you have a tiered memory system with both DRAM and CXL
+	  memory. Say N otherwise.
+
 config SLAB_OBJ_EXT
 	bool
 
