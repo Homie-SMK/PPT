@@ -1,4 +1,4 @@
-# PPT: Page Ping-pong Throttling for Linux Kernel
+# PPT: Page Ping-pong Throttling for Tiered Memory Systems
 
 A kernel memory management enhancement that reduces unnecessary page migration overhead in tiered memory systems (DRAM + CXL).
 
