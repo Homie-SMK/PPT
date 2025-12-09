@@ -1008,6 +1008,7 @@ struct mm_struct {
 #endif
 #ifdef CONFIG_PPT
 		/* Page ping-pong throttling for tiered memory */
+		spinlock_t ppt_lock;             /* Protects ppt_xarray pointer */
 		struct xarray *ppt_xarray;       /* Tracks migrated pages */
 		atomic_t ppt_entry_count;        /* Number of tracked pages */
 		struct list_head ppt_mm_list;    /* Link in global mm list */

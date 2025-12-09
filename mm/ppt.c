@@ -53,6 +53,7 @@ void ppt_mm_init(struct mm_struct *mm)
 
 	xa_init_flags(mm->ppt_xarray, XA_FLAGS_ALLOC);
 	atomic_set(&mm->ppt_entry_count, 0);
+	spin_lock_init(&mm->ppt_lock);
 	INIT_LIST_HEAD(&mm->ppt_mm_list);
 
 	spin_lock(&ppt_mm_list_lock);
@@ -69,16 +70,28 @@ void ppt_mm_init(struct mm_struct *mm)
  */
 void ppt_mm_destroy(struct mm_struct *mm)
 {
-	if (!mm->ppt_xarray)
-		return;
+	struct xarray *xa;
 
+	/* Use per-MM lock to protect pointer */
+	spin_lock(&mm->ppt_lock);
+	xa = mm->ppt_xarray;
+	if (!xa) {
+		spin_unlock(&mm->ppt_lock);
+		return;
+	}
+
+	/* Clear pointer FIRST while holding lock to prevent new references */
+	mm->ppt_xarray = NULL;
+	spin_unlock(&mm->ppt_lock);
+
+	/* Remove from global list (needs global lock) */
 	spin_lock(&ppt_mm_list_lock);
 	list_del(&mm->ppt_mm_list);
 	spin_unlock(&ppt_mm_list_lock);
 
-	xa_destroy(mm->ppt_xarray);
-	kfree(mm->ppt_xarray);
-	mm->ppt_xarray = NULL;
+	/* Now safe to destroy - no one can get new reference to xa */
+	xa_destroy(xa);
+	kfree(xa);
 }
 
 /*
@@ -111,14 +124,27 @@ bool ppt_should_throttle_promotion(struct mm_struct *mm, struct page *page,
 {
 	unsigned long pfn = page_to_pfn(page);
 	unsigned long current_jiffies = jiffies;
+	struct xarray *xa;
 	void *entry;
 	bool throttle = false;
 
-	if (!ppt_enabled || !mm->ppt_xarray)
+	if (!ppt_enabled)
 		return false;
 
-	xa_lock(mm->ppt_xarray);
-	entry = xa_load(mm->ppt_xarray, pfn);
+	/* Safely get xarray pointer under per-MM lock */
+	spin_lock(&mm->ppt_lock);
+	xa = mm->ppt_xarray;
+	if (!xa) {
+		spin_unlock(&mm->ppt_lock);
+		return false;
+	}
+
+	/* Lock xarray before releasing per-MM lock */
+	xa_lock(xa);
+	spin_unlock(&mm->ppt_lock);
+
+	/* Now xa is locked and cannot be freed */
+	entry = xa_load(xa, pfn);
 
 	if (entry && xa_is_value(entry)) {
 		unsigned long value = xa_to_value(entry);
@@ -133,7 +159,7 @@ bool ppt_should_throttle_promotion(struct mm_struct *mm, struct page *page,
 			 * This indicates state inconsistency, remove entry
 			 */
 			pr_warn_once("PPT: CXL page with pg_pingpong=0 at PFN %lx\n", pfn);
-			__xa_erase(mm->ppt_xarray, pfn);
+			__xa_erase(xa, pfn);
 			atomic_dec(&mm->ppt_entry_count);
 			atomic64_inc(&ppt_stats_state_exceptions);
 		} else {  /* pg_pingpong == 1 */
@@ -150,7 +176,7 @@ bool ppt_should_throttle_promotion(struct mm_struct *mm, struct page *page,
 				 * Enough time passed, allow promotion
 				 * Remove entry, will be re-created on successful promotion
 				 */
-				__xa_erase(mm->ppt_xarray, pfn);
+				__xa_erase(xa, pfn);
 				atomic_dec(&mm->ppt_entry_count);
 				atomic64_inc(&ppt_stats_promotions_allowed);
 			}
@@ -160,7 +186,7 @@ bool ppt_should_throttle_promotion(struct mm_struct *mm, struct page *page,
 		atomic64_inc(&ppt_stats_promotions_allowed);
 	}
 
-	xa_unlock(mm->ppt_xarray);
+	xa_unlock(xa);
 	return throttle;
 }
 
@@ -176,13 +202,19 @@ static void ppt_evict_expired_entry(struct mm_struct *mm)
 	unsigned long index;
 	void *entry;
 	unsigned long current_jiffies = jiffies & PPT_JIFFIES_MASK;
+	struct xarray *xa;
 
-	if (!mm->ppt_xarray)
+	/* Safely get xarray pointer under per-MM lock */
+	spin_lock(&mm->ppt_lock);
+	xa = mm->ppt_xarray;
+	if (!xa) {
+		spin_unlock(&mm->ppt_lock);
 		return;
+	}
+	xa_lock(xa);
+	spin_unlock(&mm->ppt_lock);
 
-	xa_lock(mm->ppt_xarray);
-
-	xa_for_each(mm->ppt_xarray, index, entry) {
+	xa_for_each(xa, index, entry) {
 		if (xa_is_value(entry)) {
 			unsigned long value = xa_to_value(entry);
 			unsigned long stored_jiffies = PPT_GET_JIFFIES(value);
@@ -198,14 +230,14 @@ static void ppt_evict_expired_entry(struct mm_struct *mm)
 
 			if (diff >= threshold) {
 				/* Entry expired, remove it */
-				__xa_erase(mm->ppt_xarray, index);
+				__xa_erase(xa, index);
 				atomic_dec(&mm->ppt_entry_count);
 				break;  /* Only evict one entry */
 			}
 		}
 	}
 
-	xa_unlock(mm->ppt_xarray);
+	xa_unlock(xa);
 }
 
 /*
@@ -223,8 +255,9 @@ void ppt_track_promotion(struct mm_struct *mm, unsigned long old_pfn,
 	unsigned long current_jiffies = jiffies & PPT_JIFFIES_MASK;
 	unsigned long value = PPT_MAKE_VALUE(current_jiffies, 0);  /* pg_pingpong=0 */
 	void *xa_value = xa_mk_value(value);
+	struct xarray *xa;
 
-	if (!ppt_enabled || !mm->ppt_xarray)
+	if (!ppt_enabled)
 		return;
 
 	/* Evict if at limit */
@@ -232,20 +265,28 @@ void ppt_track_promotion(struct mm_struct *mm, unsigned long old_pfn,
 		ppt_evict_expired_entry(mm);
 	}
 
-	xa_lock(mm->ppt_xarray);
+	/* Safely get xarray pointer under per-MM lock */
+	spin_lock(&mm->ppt_lock);
+	xa = mm->ppt_xarray;
+	if (!xa) {
+		spin_unlock(&mm->ppt_lock);
+		return;
+	}
+	xa_lock(xa);
+	spin_unlock(&mm->ppt_lock);
 
 	/* Remove old entry if exists */
-	__xa_erase(mm->ppt_xarray, old_pfn);
+	__xa_erase(xa, old_pfn);
 
 	/* Insert new entry */
-	if (xa_err(__xa_store(mm->ppt_xarray, new_pfn, xa_value, GFP_ATOMIC))) {
+	if (xa_err(__xa_store(xa, new_pfn, xa_value, GFP_ATOMIC))) {
 		/* Allocation failed, drop tracking for this page */
 		atomic64_inc(&ppt_stats_xarray_stores_failed);
 	} else {
 		atomic_inc(&mm->ppt_entry_count);
 	}
 
-	xa_unlock(mm->ppt_xarray);
+	xa_unlock(xa);
 }
 
 /*
@@ -264,14 +305,23 @@ void ppt_track_demotion(struct mm_struct *mm, unsigned long old_pfn,
 			unsigned long new_pfn)
 {
 	unsigned long current_jiffies = jiffies & PPT_JIFFIES_MASK;
+	struct xarray *xa;
 	void *entry;
 
-	if (!ppt_enabled || !mm->ppt_xarray)
+	if (!ppt_enabled)
 		return;
 
-	xa_lock(mm->ppt_xarray);
+	/* Safely get xarray pointer under per-MM lock */
+	spin_lock(&mm->ppt_lock);
+	xa = mm->ppt_xarray;
+	if (!xa) {
+		spin_unlock(&mm->ppt_lock);
+		return;
+	}
+	xa_lock(xa);
+	spin_unlock(&mm->ppt_lock);
 
-	entry = xa_load(mm->ppt_xarray, old_pfn);
+	entry = xa_load(xa, old_pfn);
 	if (entry && xa_is_value(entry)) {
 		unsigned long value = xa_to_value(entry);
 		unsigned long stored_jiffies = PPT_GET_JIFFIES(value);
@@ -285,8 +335,8 @@ void ppt_track_demotion(struct mm_struct *mm, unsigned long old_pfn,
 			unsigned long new_value = PPT_MAKE_VALUE(current_jiffies, 1);
 			void *xa_value = xa_mk_value(new_value);
 
-			__xa_erase(mm->ppt_xarray, old_pfn);
-			if (xa_err(__xa_store(mm->ppt_xarray, new_pfn, xa_value, GFP_ATOMIC))) {
+			__xa_erase(xa, old_pfn);
+			if (xa_err(__xa_store(xa, new_pfn, xa_value, GFP_ATOMIC))) {
 				atomic64_inc(&ppt_stats_xarray_stores_failed);
 				atomic_dec(&mm->ppt_entry_count);
 			} else {
@@ -297,13 +347,13 @@ void ppt_track_demotion(struct mm_struct *mm, unsigned long old_pfn,
 			 * Long-lived in DRAM: page is not a ping-pong page
 			 * Remove tracking, no need to throttle future promotions
 			 */
-			__xa_erase(mm->ppt_xarray, old_pfn);
+			__xa_erase(xa, old_pfn);
 			atomic_dec(&mm->ppt_entry_count);
 			atomic64_inc(&ppt_stats_demotions_long_lived);
 		}
 	}
 
-	xa_unlock(mm->ppt_xarray);
+	xa_unlock(xa);
 }
 
 /*
@@ -322,13 +372,19 @@ static unsigned long ppt_shrink_mm_xarray(struct mm_struct *mm,
 	void *entry;
 	unsigned long current_jiffies = jiffies & PPT_JIFFIES_MASK;
 	unsigned long freed = 0;
+	struct xarray *xa;
 
-	if (!mm->ppt_xarray)
+	/* Safely get xarray pointer under per-MM lock */
+	spin_lock(&mm->ppt_lock);
+	xa = mm->ppt_xarray;
+	if (!xa) {
+		spin_unlock(&mm->ppt_lock);
 		return 0;
+	}
+	xa_lock(xa);
+	spin_unlock(&mm->ppt_lock);
 
-	xa_lock(mm->ppt_xarray);
-
-	xa_for_each(mm->ppt_xarray, index, entry) {
+	xa_for_each(xa, index, entry) {
 		if (freed >= nr_to_scan)
 			break;
 
@@ -347,14 +403,14 @@ static unsigned long ppt_shrink_mm_xarray(struct mm_struct *mm,
 
 			if (diff >= threshold) {
 				/* Entry expired, remove it */
-				__xa_erase(mm->ppt_xarray, index);
+				__xa_erase(xa, index);
 				atomic_dec(&mm->ppt_entry_count);
 				freed++;
 			}
 		}
 	}
 
-	xa_unlock(mm->ppt_xarray);
+	xa_unlock(xa);
 
 	return freed;
 }
